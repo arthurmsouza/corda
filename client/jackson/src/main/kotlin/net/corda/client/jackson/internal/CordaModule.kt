@@ -2,30 +2,38 @@
 
 package net.corda.client.jackson.internal
 
+import com.fasterxml.jackson.annotation.JsonInclude
+import com.fasterxml.jackson.annotation.JsonInclude.Include
+import com.fasterxml.jackson.annotation.JsonTypeInfo
 import com.fasterxml.jackson.annotation.JsonValue
 import com.fasterxml.jackson.core.JsonGenerator
+import com.fasterxml.jackson.core.JsonParseException
 import com.fasterxml.jackson.core.JsonParser
 import com.fasterxml.jackson.core.JsonToken
 import com.fasterxml.jackson.databind.*
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize
 import com.fasterxml.jackson.databind.annotation.JsonSerialize
 import com.fasterxml.jackson.databind.module.SimpleModule
+import com.fasterxml.jackson.databind.node.IntNode
 import com.fasterxml.jackson.databind.node.ObjectNode
 import com.fasterxml.jackson.databind.ser.BeanPropertyWriter
 import com.fasterxml.jackson.databind.ser.BeanSerializerModifier
+import com.google.common.primitives.Booleans
 import net.corda.client.jackson.JacksonSupport
-import net.corda.core.contracts.Amount
-import net.corda.core.crypto.DigitalSignature
-import net.corda.core.crypto.SecureHash
-import net.corda.core.crypto.TransactionSignature
+import net.corda.core.contracts.*
+import net.corda.core.crypto.*
 import net.corda.core.identity.*
 import net.corda.core.internal.DigitalSignatureWithCert
+import net.corda.core.internal.kotlinObjectInstance
 import net.corda.core.node.NodeInfo
-import net.corda.core.serialization.*
-import net.corda.core.transactions.SignedTransaction
-import net.corda.core.transactions.WireTransaction
+import net.corda.core.serialization.SerializedBytes
+import net.corda.core.serialization.deserialize
+import net.corda.core.serialization.serialize
+import net.corda.core.transactions.*
 import net.corda.core.utilities.ByteSequence
 import net.corda.core.utilities.NetworkHostAndPort
+import net.corda.core.utilities.parseAsHex
+import net.corda.core.utilities.toHexString
 import net.corda.serialization.internal.AllWhitelist
 import net.corda.serialization.internal.amqp.SerializerFactory
 import net.corda.serialization.internal.amqp.constructorForDeserialization
@@ -33,6 +41,7 @@ import net.corda.serialization.internal.amqp.hasCordaSerializable
 import net.corda.serialization.internal.amqp.propertiesForSerialization
 import java.security.PublicKey
 import java.security.cert.CertPath
+import java.time.Instant
 
 class CordaModule : SimpleModule("corda-core") {
     override fun setupModule(context: SetupContext) {
@@ -50,12 +59,19 @@ class CordaModule : SimpleModule("corda-core") {
         context.setMixInAnnotations(PublicKey::class.java, PublicKeyMixin::class.java)
         context.setMixInAnnotations(ByteSequence::class.java, ByteSequenceMixin::class.java)
         context.setMixInAnnotations(SecureHash.SHA256::class.java, SecureHashSHA256Mixin::class.java)
+        context.setMixInAnnotations(SecureHash::class.java, SecureHashSHA256Mixin::class.java)
         context.setMixInAnnotations(SerializedBytes::class.java, SerializedBytesMixin::class.java)
         context.setMixInAnnotations(DigitalSignature.WithKey::class.java, ByteSequenceWithPropertiesMixin::class.java)
         context.setMixInAnnotations(DigitalSignatureWithCert::class.java, ByteSequenceWithPropertiesMixin::class.java)
         context.setMixInAnnotations(TransactionSignature::class.java, ByteSequenceWithPropertiesMixin::class.java)
         context.setMixInAnnotations(SignedTransaction::class.java, SignedTransactionMixin::class.java)
-        context.setMixInAnnotations(WireTransaction::class.java, JacksonSupport.WireTransactionMixin::class.java)
+        context.setMixInAnnotations(WireTransaction::class.java, WireTransactionMixin::class.java)
+        context.setMixInAnnotations(TransactionState::class.java, TransactionStateMixin::class.java)
+        context.setMixInAnnotations(Command::class.java, CommandMixin::class.java)
+        context.setMixInAnnotations(TimeWindow::class.java, TimeWindowMixin::class.java)
+        context.setMixInAnnotations(PrivacySalt::class.java, PrivacySaltMixin::class.java)
+        context.setMixInAnnotations(SignatureScheme::class.java, SignatureSchemeMixin::class.java)
+        context.setMixInAnnotations(SignatureMetadata::class.java, SignatureMetadataMixin::class.java)
         context.setMixInAnnotations(NodeInfo::class.java, NodeInfoMixin::class.java)
     }
 }
@@ -64,15 +80,16 @@ class CordaModule : SimpleModule("corda-core") {
  * Use the same properties that AMQP serialization uses if the POJO is @CordaSerializable
  */
 private class CordaSerializableBeanSerializerModifier : BeanSerializerModifier() {
-    // We need a SerializerFactory when scanning for properties but don't actually use it so any will do
-    private val serializerFactory = SerializerFactory(AllWhitelist, Thread.currentThread().contextClassLoader)
+    // We need to pass in a SerializerFactory when scanning for properties, but don't actually do any serialisation so any will do
+    private val serializerFactory = SerializerFactory(AllWhitelist, javaClass.classLoader)
 
     override fun changeProperties(config: SerializationConfig,
                                   beanDesc: BeanDescription,
                                   beanProperties: MutableList<BeanPropertyWriter>): MutableList<BeanPropertyWriter> {
-        if (hasCordaSerializable(beanDesc.beanClass)) {
-            val ctor = constructorForDeserialization(beanDesc.beanClass)
-            val amqpProperties = propertiesForSerialization(ctor, beanDesc.beanClass, serializerFactory)
+        val beanClass = beanDesc.beanClass
+        if (hasCordaSerializable(beanClass) && beanClass.kotlinObjectInstance == null) {
+            val ctor = constructorForDeserialization(beanClass)
+            val amqpProperties = propertiesForSerialization(ctor, beanClass, serializerFactory)
                     .serializationOrder
                     .map { it.serializer.name }
             beanProperties.removeIf { it.name !in amqpProperties }
@@ -88,11 +105,7 @@ private class CordaSerializableBeanSerializerModifier : BeanSerializerModifier()
 @JsonDeserialize(using = NetworkHostAndPortDeserializer::class)
 private interface NetworkHostAndPortMixin
 
-private class NetworkHostAndPortDeserializer : JsonDeserializer<NetworkHostAndPort>() {
-    override fun deserialize(parser: JsonParser, ctxt: DeserializationContext): NetworkHostAndPort {
-        return NetworkHostAndPort.parse(parser.text)
-    }
-}
+private class NetworkHostAndPortDeserializer : SimpleDeserializer<NetworkHostAndPort>({ NetworkHostAndPort.parse(text) })
 
 @JsonSerialize(using = PartyAndCertificateSerializer::class)
 // TODO Add deserialization which follows the same lookup logic as Party
@@ -102,14 +115,14 @@ private class PartyAndCertificateSerializer : JsonSerializer<PartyAndCertificate
     override fun serialize(value: PartyAndCertificate, gen: JsonGenerator, serializers: SerializerProvider) {
         val mapper = gen.codec as JacksonSupport.PartyObjectMapper
         if (mapper.isFullParties) {
-            gen.writeObject(PartyAndCertificateWrapper(value.name, value.certPath))
+            gen.writeObject(PartyAndCertificateJson(value.name, value.certPath))
         } else {
             gen.writeObject(value.party)
         }
     }
 }
 
-private class PartyAndCertificateWrapper(val name: CordaX500Name, val certPath: CertPath)
+private class PartyAndCertificateJson(val name: CordaX500Name, val certPath: CertPath)
 
 @JsonSerialize(using = SignedTransactionSerializer::class)
 @JsonDeserialize(using = SignedTransactionDeserializer::class)
@@ -117,18 +130,177 @@ private interface SignedTransactionMixin
 
 private class SignedTransactionSerializer : JsonSerializer<SignedTransaction>() {
     override fun serialize(value: SignedTransaction, gen: JsonGenerator, serializers: SerializerProvider) {
-        gen.writeObject(SignedTransactionWrapper(value.txBits.bytes, value.sigs))
+        val core = value.coreTransaction
+        val stxJson = when (core) {
+            is WireTransaction -> StxJson(wire = core, signatures = value.sigs)
+            is FilteredTransaction -> StxJson(filtered = core, signatures = value.sigs)
+            is NotaryChangeWireTransaction -> StxJson(notaryChangeWire = core, signatures = value.sigs)
+            is ContractUpgradeWireTransaction -> StxJson(contractUpgradeWire = core, signatures = value.sigs)
+            is ContractUpgradeFilteredTransaction -> StxJson(contractUpgradeFiltered = core, signatures = value.sigs)
+            else -> throw IllegalArgumentException("Don't know about ${core.javaClass}")
+        }
+        gen.writeObject(stxJson)
     }
 }
 
 private class SignedTransactionDeserializer : JsonDeserializer<SignedTransaction>() {
     override fun deserialize(parser: JsonParser, ctxt: DeserializationContext): SignedTransaction {
-        val wrapper = parser.readValueAs<SignedTransactionWrapper>()
-        return SignedTransaction(SerializedBytes(wrapper.txBits), wrapper.signatures)
+        val wrapper = parser.readValueAs<StxJson>()
+        val core = wrapper.run { wire ?: filtered ?: notaryChangeWire ?: contractUpgradeWire ?: contractUpgradeFiltered!! }
+        return SignedTransaction(core, wrapper.signatures)
     }
 }
 
-private class SignedTransactionWrapper(val txBits: ByteArray, val signatures: List<TransactionSignature>)
+@JsonInclude(Include.NON_NULL)
+private data class StxJson(
+        val wire: WireTransaction? = null,
+        val filtered: FilteredTransaction? = null,
+        val notaryChangeWire: NotaryChangeWireTransaction? = null,
+        val contractUpgradeWire: ContractUpgradeWireTransaction? = null,
+        val contractUpgradeFiltered: ContractUpgradeFilteredTransaction? = null,
+        val signatures: List<TransactionSignature>
+) {
+    init {
+        val count = Booleans.countTrue(wire != null, filtered != null, notaryChangeWire != null, contractUpgradeWire != null, contractUpgradeFiltered != null)
+        require(count == 1) { this }
+    }
+}
+
+@JsonSerialize(using = WireTransactionSerializer::class)
+@JsonDeserialize(using = WireTransactionDeserializer::class)
+private interface WireTransactionMixin
+
+private class WireTransactionSerializer : JsonSerializer<WireTransaction>() {
+    override fun serialize(value: WireTransaction, gen: JsonGenerator, serializers: SerializerProvider) {
+        gen.writeObject(WireTransactionJson(
+                value.id,
+                value.notary,
+                value.inputs,
+                value.attachments,
+                value.outputs,
+                value.commands,
+                value.timeWindow,
+                value.privacySalt
+        ))
+    }
+}
+
+private class WireTransactionDeserializer : JsonDeserializer<WireTransaction>() {
+    override fun deserialize(parser: JsonParser, ctxt: DeserializationContext): WireTransaction {
+        val wrapper = parser.readValueAs<WireTransactionJson>()
+        val componentGroups = WireTransaction.createComponentGroups(
+                wrapper.inputs,
+                wrapper.outputs,
+                wrapper.commands,
+                wrapper.attachments,
+                wrapper.notary,
+                wrapper.timeWindow
+        )
+        return WireTransaction(componentGroups, wrapper.privacySalt)
+    }
+}
+
+private class WireTransactionJson(val id: SecureHash,
+                                  val notary: Party?,
+                                  val inputs: List<StateRef>,
+                                  val attachments: List<SecureHash>,
+                                  val outputs: List<TransactionState<*>>,
+                                  val commands: List<Command<*>>,
+                                  val timeWindow: TimeWindow?,
+                                  val privacySalt: PrivacySalt)
+
+private interface TransactionStateMixin {
+    @get:JsonTypeInfo(use = JsonTypeInfo.Id.CLASS)
+    val data: ContractState
+    @get:JsonTypeInfo(use = JsonTypeInfo.Id.CLASS)
+    val constraint: AttachmentConstraint
+}
+
+private interface CommandMixin {
+    @get:JsonTypeInfo(use = JsonTypeInfo.Id.CLASS)
+    val value: CommandData
+}
+
+@JsonDeserialize(using = TimeWindowDeserializer::class)
+private interface TimeWindowMixin
+
+private class TimeWindowDeserializer : JsonDeserializer<TimeWindow>() {
+    override fun deserialize(parser: JsonParser, ctxt: DeserializationContext): TimeWindow {
+        return parser.readValueAs<TimeWindowJson>().run {
+            when {
+                fromTime != null && untilTime != null -> TimeWindow.between(fromTime, untilTime)
+                fromTime != null -> TimeWindow.fromOnly(fromTime)
+                untilTime != null -> TimeWindow.untilOnly(untilTime)
+                else -> throw JsonParseException(parser, "Neither fromTime nor untilTime exists for TimeWindow")
+            }
+        }
+    }
+}
+
+private data class TimeWindowJson(val fromTime: Instant?, val untilTime: Instant?)
+
+@JsonSerialize(using = PrivacySaltSerializer::class)
+@JsonDeserialize(using = PrivacySaltDeserializer::class)
+private interface PrivacySaltMixin
+
+private class PrivacySaltSerializer : JsonSerializer<PrivacySalt>() {
+    override fun serialize(value: PrivacySalt, gen: JsonGenerator, serializers: SerializerProvider) {
+        gen.writeString(value.bytes.toHexString())
+    }
+}
+
+private class PrivacySaltDeserializer : SimpleDeserializer<PrivacySalt>({ PrivacySalt(text.parseAsHex()) })
+
+private val signatureSchemesByCodeName = Crypto.supportedSignatureSchemes().associateBy({ it.schemeCodeName }, { it })
+private val signatureSchemesByNumberID = Crypto.supportedSignatureSchemes().associateBy({ it.schemeNumberID }, { it })
+
+@JsonSerialize(using = SignatureMetadataSerializer::class)
+@JsonDeserialize(using = SignatureMetadataDeserializer::class)
+private interface SignatureMetadataMixin
+
+private class SignatureMetadataSerializer : JsonSerializer<SignatureMetadata>() {
+    override fun serialize(value: SignatureMetadata, gen: JsonGenerator, serializers: SerializerProvider) {
+        gen.jsonObject {
+            writeNumberField("platformVersion", value.platformVersion)
+            writeObjectField("scheme", value.schemeNumberID.let { signatureSchemesByNumberID[it] ?: it })
+        }
+    }
+}
+
+private class SignatureMetadataDeserializer : JsonDeserializer<SignatureMetadata>() {
+    override fun deserialize(parser: JsonParser, ctxt: DeserializationContext): SignatureMetadata {
+        val json = parser.readValueAsTree<ObjectNode>()
+        val scheme = json["scheme"]
+        val schemeNumberID = if (scheme is IntNode) {
+            scheme.intValue()
+        } else {
+            signatureSchemesByCodeName[scheme.textValue()]?.schemeNumberID
+                    ?: throw JsonParseException(parser, "Unable to find SignatureScheme ${scheme.textValue()}")
+        }
+        return SignatureMetadata(json["platformVersion"].intValue(), schemeNumberID)
+    }
+}
+
+@JsonSerialize(using = SignatureSchemeSerializer::class)
+@JsonDeserialize(using = SignatureSchemeDeserializer::class)
+private interface SignatureSchemeMixin
+
+private class SignatureSchemeSerializer : JsonSerializer<SignatureScheme>() {
+    override fun serialize(value: SignatureScheme, gen: JsonGenerator, serializers: SerializerProvider) {
+        gen.writeString(value.schemeCodeName)
+    }
+}
+
+private class SignatureSchemeDeserializer : JsonDeserializer<SignatureScheme>() {
+    override fun deserialize(parser: JsonParser, ctxt: DeserializationContext): SignatureScheme {
+        val signatureScheme = if (parser.currentToken == JsonToken.VALUE_NUMBER_INT) {
+            signatureSchemesByNumberID[parser.intValue]
+        } else {
+            signatureSchemesByCodeName[parser.text]
+        }
+        return signatureScheme ?: throw JsonParseException(parser, "Unable to find SignatureScheme ${parser.text}")
+    }
+}
 
 @JsonSerialize(using = SerializedBytesSerializer::class)
 @JsonDeserialize(using = SerializedBytesDeserializer::class)
