@@ -96,6 +96,9 @@ Unreleased
 
 * Node can be shut down abruptly by ``shutdown`` function in `CordaRPCOps` or gracefully (draining flows first) through ``gracefulShutdown`` command from shell.
 
+* A method to check if public key satisfies algorithm specs has been made public, `Crypto.validatePublicKey(java.security.PublicKey)`.
+  For instance, this method will check if an ECC key lies on a valid curve or if an RSA key is >= 2048bits.
+
 .. _changelog_v3.1:
 
 Version 3.1
